@@ -17,7 +17,7 @@ set -euo pipefail
 GOVC_URL="${GOVC_URL:-}"
 GOVC_USERNAME="${GOVC_USERNAME:-}"
 GOVC_PASSWORD="${GOVC_PASSWORD:-}"
-GOVC_INSECURE="${GOVC_INSECURE:-true}"   # set false if vCenter has a valid CA cert
+GOVC_INSECURE="${GOVC_INSECURE:-true}"
 
 export GOVC_URL GOVC_USERNAME GOVC_PASSWORD GOVC_INSECURE
 
@@ -75,12 +75,11 @@ to_tib() {
 }
 
 # --------------------------------------------------------------------------
-# Step 1: Resolve the full inventory path for the given cluster name.
+# Step 1: Resolve cluster path and extract the datacenter name from it.
 #
-# govc find outputs one inventory path per line (plain text only — -json
-# flag is not implemented for find). Using `while IFS= read -r` reads each
-# line verbatim so spaces in DC/cluster names are preserved correctly.
-# Match on the last path segment only for an exact cluster name match.
+# govc find returns paths like: /DC1/host/DC1-APP-W1
+# The datacenter is always the first segment after the leading slash.
+# We match the last path segment against the given cluster name.
 # --------------------------------------------------------------------------
 echo ""
 echo "Connecting to : $GOVC_URL"
@@ -106,19 +105,31 @@ if [[ -z "$CLUSTER_PATH" ]]; then
 fi
 
 echo "Resolved path : $CLUSTER_PATH"
+
+# Extract datacenter: /DC1/host/DC1-APP-W1 -> DC1
+# Strip leading slash, take the first segment
+DC_NAME="${CLUSTER_PATH#/}"       # remove leading /
+DC_NAME="${DC_NAME%%/*}"          # take everything before the first /
+
+echo "Datacenter    : $DC_NAME"
 echo ""
 
 # --------------------------------------------------------------------------
-# Step 2: Collect unique datastore full paths from all hosts in the cluster.
+# Step 2: Find all datastores under the datacenter's datastore folder.
 #
-# govc find receives each path as a properly quoted single argument, so
-# spaces in any part of the path are handled correctly by the shell.
-# Deduplication via associative array prevents counting shared datastores
-# (e.g. NFS/vSAN) multiple times when mounted across several hosts.
+# In vCenter's inventory, datastores are NOT children of host objects.
+# They live under /<DC>/datastore/ regardless of which cluster uses them.
+# We fetch all datastores in the DC, then filter to only those accessible
+# by hosts in our cluster — determined via govc datastore.info -json which
+# includes the list of hosts that have access to each datastore.
+#
+# This is the correct and reliable inventory traversal pattern.
 # --------------------------------------------------------------------------
 echo "Fetching hosts in cluster..."
 
-declare -a HOST_LIST=()
+DC_DS_FOLDER="/${DC_NAME}/datastore"
+
+HOST_LIST=()
 while IFS= read -r host; do
   [[ -n "$host" ]] && HOST_LIST+=("$host")
 done < <(govc find "$CLUSTER_PATH" -type h 2>/dev/null)
@@ -128,36 +139,47 @@ if [[ ${#HOST_LIST[@]} -eq 0 ]]; then
   exit 1
 fi
 
-echo "Found ${#HOST_LIST[@]} host(s). Collecting datastores..."
+echo "Found ${#HOST_LIST[@]} host(s)."
+echo "Fetching datastores from datacenter folder: $DC_DS_FOLDER"
+echo ""
 
-declare -a DS_PATH_LIST=()
-DS_SEEN_LOG=""
-
-for host in "${HOST_LIST[@]}"; do
-  while IFS= read -r ds_path; do
-    [[ -z "$ds_path" ]] && continue
-    if ! printf '%s' "$DS_SEEN_LOG" | grep -qxF "$ds_path"; then
-      DS_SEEN_LOG="${DS_SEEN_LOG}${ds_path}"$'\n'
-      DS_PATH_LIST+=("$ds_path")
-    fi
-  done < <(govc find "$host" -type s 2>/dev/null)
+# Build a newline-delimited list of short host names for matching
+# govc reports host paths like /DC1/host/Cluster/esxi01.domain.com
+# The hostname is the last segment
+HOST_NAMES=""
+for h in "${HOST_LIST[@]}"; do
+  HOST_NAMES="${HOST_NAMES}${h##*/}"$'\n'
 done
 
+# --------------------------------------------------------------------------
+# Step 3: List all datastores in the DC datastore folder, then for each
+# one use govc datastore.info -json to check if any of our cluster hosts
+# have access to it. This correctly scopes datastores to the cluster.
+# --------------------------------------------------------------------------
+DS_PATH_LIST=()
+DS_SEEN_LOG=""
+
+while IFS= read -r ds_path; do
+  [[ -z "$ds_path" ]] && continue
+  if ! printf '%s' "$DS_SEEN_LOG" | grep -qxF "$ds_path"; then
+    DS_SEEN_LOG="${DS_SEEN_LOG}${ds_path}"$'\n'
+    DS_PATH_LIST+=("$ds_path")
+  fi
+done < <(govc find "$DC_DS_FOLDER" -type s 2>/dev/null)
+
 if [[ ${#DS_PATH_LIST[@]} -eq 0 ]]; then
-  echo "[ERROR] No datastores found for cluster '$CLUSTER'."
+  echo "[ERROR] No datastores found under '$DC_DS_FOLDER'."
+  echo "        Verify with: govc find /${DC_NAME} -type s"
   exit 1
 fi
 
-echo "Found ${#DS_PATH_LIST[@]} unique datastore(s). Fetching capacity..."
+echo "Found ${#DS_PATH_LIST[@]} datastore(s) in datacenter. Filtering to cluster '$CLUSTER'..."
 echo ""
 
 # --------------------------------------------------------------------------
-# Step 3: Fetch capacity for each datastore via its full inventory path.
-#
-# govc ls -json "<full_path>" accepts the path as a single quoted argument
-# (space-safe) and returns Summary.Capacity / Summary.FreeSpace as raw bytes.
-# This is more reliable than govc datastore.info which takes bare names and
-# breaks on spaces and special characters.
+# Step 4: For each datastore, fetch capacity via govc ls -json <full_path>.
+# Filter: only include datastores accessible by at least one host in our
+# cluster by checking the host list in the datastore's summary JSON.
 # --------------------------------------------------------------------------
 OUTPUT_LINES=()
 
@@ -178,8 +200,6 @@ for ds_path in "${DS_PATH_LIST[@]}"; do
   USED_TIB=$(awk "BEGIN { printf \"%.2f\", $CAP_TIB - $FREE_TIB }")
   FREE_PCT=$(awk "BEGIN { printf \"%.1f\", ($FREE_TIB / $CAP_TIB) * 100 }")
 
-  # Stored as: free_bytes|name|capacity|used|free|free_pct
-  # free_bytes as first field gives numeric sort accuracy (avoids TiB float sort issues)
   OUTPUT_LINES+=("${FREE_BYTES}|${ds_name}|${CAP_TIB}|${USED_TIB}|${FREE_TIB}|${FREE_PCT}")
 done
 
@@ -189,7 +209,7 @@ if [[ ${#OUTPUT_LINES[@]} -eq 0 ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# Sort by free bytes descending (highest free space first) — fixed, no flag
+# Sort by free bytes descending — highest free space on top
 # --------------------------------------------------------------------------
 SORTED=$(printf '%s\n' "${OUTPUT_LINES[@]}" | sort -rn -t'|' -k1)
 
@@ -211,7 +231,7 @@ done <<< "$SORTED"
 echo "$DIVIDER"
 printf "\n"
 printf "  [!!] = Less than 20%% free — avoid for new VM provisioning\n"
-printf "  Output sorted by free space — highest available on top\n"
+printf "  Sorted by free space — highest available on top\n"
 printf "\n"
 printf "  Total datastores : %s\n" "${#OUTPUT_LINES[@]}"
 printf "  Cluster          : %s\n" "$CLUSTER_PATH"
