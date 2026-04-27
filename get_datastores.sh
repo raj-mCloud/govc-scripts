@@ -1,51 +1,46 @@
 #!/usr/bin/env bash
 # =============================================================================
 # get_datastores.sh
-# Lists datastore capacity, used, and free space (TiB) for a given vCenter
-# cluster. Handles cluster/datacenter names with spaces safely.
+# Lists datastores for a given vCenter cluster sorted by free space (highest
+# first) — ready to pick for VM provisioning.
 #
 # Requirements : govc (brew install govc), jq (brew install jq)
 # Operations   : READ-ONLY — no writes, no state changes in vCenter
-# Usage        : ./get_datastores.sh -c <cluster_name> [-s <sort_by>]
+# Usage        : ./get_datastores.sh -c <cluster_name>
 # =============================================================================
 
 set -euo pipefail
 
 # --------------------------------------------------------------------------
-# vCenter credentials — set via environment or export before running
+# vCenter credentials — export before running or set inline
 # --------------------------------------------------------------------------
 GOVC_URL="${GOVC_URL:-}"
 GOVC_USERNAME="${GOVC_USERNAME:-}"
 GOVC_PASSWORD="${GOVC_PASSWORD:-}"
-GOVC_INSECURE="${GOVC_INSECURE:-true}"   # set false if vCenter has valid CA cert
+GOVC_INSECURE="${GOVC_INSECURE:-true}"   # set false if vCenter has a valid CA cert
 
 export GOVC_URL GOVC_USERNAME GOVC_PASSWORD GOVC_INSECURE
 
-# --------------------------------------------------------------------------
-# Defaults
-# --------------------------------------------------------------------------
 CLUSTER=""
-SORT_BY="free"   # options: name | capacity | used | free
 
 # --------------------------------------------------------------------------
 # Usage
 # --------------------------------------------------------------------------
 usage() {
   echo ""
-  echo "Usage: $(basename "$0") -c <cluster_name> [-s <sort_by>]"
+  echo "Usage: $(basename "$0") -c <cluster_name>"
   echo ""
-  echo "  -c  Cluster name as it appears in vCenter (required)"
-  echo "      Handles names with spaces — wrap in quotes: -c 'My Cluster 01'"
-  echo "  -s  Sort by: name | capacity | used | free  (default: free)"
+  echo "  -c  Cluster name as shown in vCenter (required)"
+  echo "      Names with spaces must be quoted: -c 'My Cluster 01'"
   echo ""
-  echo "Environment variables (must be set before running):"
-  echo "  GOVC_URL        vCenter URL        e.g. https://vcenter.example.com"
-  echo "  GOVC_USERNAME   vCenter username   e.g. administrator@vsphere.local"
-  echo "  GOVC_PASSWORD   vCenter password"
+  echo "Environment variables (must be exported before running):"
+  echo "  GOVC_URL        e.g. https://vcenter.example.com"
+  echo "  GOVC_USERNAME   e.g. administrator@vsphere.local"
+  echo "  GOVC_PASSWORD"
   echo ""
   echo "Examples:"
   echo "  ./get_datastores.sh -c 'DC1-APP-W1'"
-  echo "  ./get_datastores.sh -c 'My Cluster 01' -s capacity"
+  echo "  ./get_datastores.sh -c 'My Cluster 01'"
   echo ""
   exit 1
 }
@@ -53,83 +48,60 @@ usage() {
 # --------------------------------------------------------------------------
 # Parse arguments
 # --------------------------------------------------------------------------
-while getopts ":c:s:h" opt; do
+while getopts ":c:h" opt; do
   case $opt in
     c) CLUSTER="$OPTARG" ;;
-    s) SORT_BY="$OPTARG" ;;
     h) usage ;;
     *) echo "Unknown option: -$OPTARG"; usage ;;
   esac
 done
 
 # --------------------------------------------------------------------------
-# Validate inputs
+# Validate
 # --------------------------------------------------------------------------
-[[ -z "$CLUSTER" ]]       && echo "[ERROR] Cluster name is required. Use -c <cluster_name>" && usage
+[[ -z "$CLUSTER" ]]       && echo "[ERROR] -c <cluster_name> is required." && usage
 [[ -z "$GOVC_URL" ]]      && echo "[ERROR] GOVC_URL is not set."      && exit 1
 [[ -z "$GOVC_USERNAME" ]] && echo "[ERROR] GOVC_USERNAME is not set." && exit 1
 [[ -z "$GOVC_PASSWORD" ]] && echo "[ERROR] GOVC_PASSWORD is not set." && exit 1
 
-if ! command -v govc &>/dev/null; then
-  echo "[ERROR] govc is not installed or not in PATH."
-  echo "        Install via: brew install govc"
-  exit 1
-fi
-
-if ! command -v jq &>/dev/null; then
-  echo "[ERROR] jq is not installed or not in PATH."
-  echo "        Install via: brew install jq"
-  exit 1
-fi
-
-if ! [[ "$SORT_BY" =~ ^(name|capacity|used|free)$ ]]; then
-  echo "[ERROR] Invalid sort option '$SORT_BY'. Choose from: name | capacity | used | free"
-  exit 1
-fi
+command -v govc &>/dev/null || { echo "[ERROR] govc not found. Install: brew install govc"; exit 1; }
+command -v jq   &>/dev/null || { echo "[ERROR] jq not found.   Install: brew install jq";   exit 1; }
 
 # --------------------------------------------------------------------------
-# Helper: convert bytes to TiB
+# Helper: bytes -> TiB
 # --------------------------------------------------------------------------
 to_tib() {
   awk "BEGIN { printf \"%.2f\", $1 / (1024^4) }"
 }
 
 # --------------------------------------------------------------------------
-# Step 1: Resolve cluster — fetch ALL clusters as JSON, match by name
+# Step 1: Resolve the full inventory path for the given cluster name.
 #
-# Why JSON + jq instead of plain text grep?
-# govc find returns paths like: ./host/DC One/My Cluster 01
-# Shell word-splitting on spaces breaks grep and variable passing.
-# JSON output keeps each object as a structured record — spaces in names
-# are handled natively by jq without any quoting workarounds.
+# govc find outputs one inventory path per line (plain text only — -json
+# flag is not implemented for find). Using `while IFS= read -r` reads each
+# line verbatim so spaces in DC/cluster names are preserved correctly.
+# Match on the last path segment only for an exact cluster name match.
 # --------------------------------------------------------------------------
 echo ""
 echo "Connecting to : $GOVC_URL"
 echo "Cluster       : $CLUSTER"
-echo "Sorted by     : $SORT_BY"
 echo ""
 echo "Resolving cluster path..."
 
-# -json returns a JSON array; each element has a "Path" field
-ALL_CLUSTERS_JSON=$(govc find . -type ClusterComputeResource -json 2>/dev/null)
-
-if [[ -z "$ALL_CLUSTERS_JSON" || "$ALL_CLUSTERS_JSON" == "null" ]]; then
-  echo "[ERROR] Could not retrieve cluster list from vCenter. Check credentials and URL."
-  exit 1
-fi
-
-# Match cluster whose path ends with /<CLUSTER> or equals <CLUSTER> exactly
-# Using jq's test() with a regex so spaces in the name are matched literally
-CLUSTER_PATH=$(echo "$ALL_CLUSTERS_JSON" | \
-  jq -r --arg name "$CLUSTER" \
-  '.[] | select(.Path | test("(^|/)" + ($name | gsub("\\s"; "\\s")) + "$")) | .Path' \
-  2>/dev/null | head -1)
+CLUSTER_PATH=""
+while IFS= read -r line; do
+  segment="${line##*/}"
+  if [[ "$segment" == "$CLUSTER" ]]; then
+    CLUSTER_PATH="$line"
+    break
+  fi
+done < <(govc find / -type ClusterComputeResource 2>/dev/null)
 
 if [[ -z "$CLUSTER_PATH" ]]; then
-  echo "[ERROR] Cluster '$CLUSTER' not found in vCenter."
+  echo "[ERROR] Cluster '$CLUSTER' not found."
   echo ""
   echo "Available clusters:"
-  echo "$ALL_CLUSTERS_JSON" | jq -r '.[].Path' 2>/dev/null | sed 's/^/  /'
+  govc find / -type ClusterComputeResource 2>/dev/null | sed 's/^/  /'
   exit 1
 fi
 
@@ -137,115 +109,110 @@ echo "Resolved path : $CLUSTER_PATH"
 echo ""
 
 # --------------------------------------------------------------------------
-# Step 2: Get ESXi hosts in the cluster (JSON, safe for spaces)
+# Step 2: Collect unique datastore full paths from all hosts in the cluster.
+#
+# govc find receives each path as a properly quoted single argument, so
+# spaces in any part of the path are handled correctly by the shell.
+# Deduplication via associative array prevents counting shared datastores
+# (e.g. NFS/vSAN) multiple times when mounted across several hosts.
 # --------------------------------------------------------------------------
 echo "Fetching hosts in cluster..."
 
-HOST_PATHS_JSON=$(govc find "$CLUSTER_PATH" -type h -json 2>/dev/null)
+declare -a HOST_LIST=()
+while IFS= read -r host; do
+  [[ -n "$host" ]] && HOST_LIST+=("$host")
+done < <(govc find "$CLUSTER_PATH" -type h 2>/dev/null)
 
-if [[ -z "$HOST_PATHS_JSON" || "$HOST_PATHS_JSON" == "null" || "$HOST_PATHS_JSON" == "[]" ]]; then
-  echo "[ERROR] No ESXi hosts found under cluster '$CLUSTER_PATH'."
+if [[ ${#HOST_LIST[@]} -eq 0 ]]; then
+  echo "[ERROR] No ESXi hosts found under '$CLUSTER_PATH'."
   exit 1
 fi
 
-# Extract host paths into a bash array (newline-delimited, handles spaces)
-mapfile -t HOST_PATHS < <(echo "$HOST_PATHS_JSON" | jq -r '.[].Path')
+echo "Found ${#HOST_LIST[@]} host(s). Collecting datastores..."
 
-echo "Found ${#HOST_PATHS[@]} host(s). Collecting datastores..."
-echo ""
+declare -A SEEN_DS=()
+declare -a DS_PATH_LIST=()
 
-# --------------------------------------------------------------------------
-# Step 3: Collect unique datastore paths across all hosts (JSON, safe)
-# Each host returns its mounted datastores; we deduplicate across hosts.
-# --------------------------------------------------------------------------
-declare -A SEEN_DS
-DS_NAME_LIST=()
-
-for host in "${HOST_PATHS[@]}"; do
-  DS_JSON=$(govc find "$host" -type s -json 2>/dev/null) || continue
-  [[ -z "$DS_JSON" || "$DS_JSON" == "null" || "$DS_JSON" == "[]" ]] && continue
-
+for host in "${HOST_LIST[@]}"; do
   while IFS= read -r ds_path; do
-    # Extract the datastore name = last segment after /datastore/
-    ds_name="${ds_path##*/datastore/}"
-    if [[ -z "${SEEN_DS[$ds_name]+_}" ]]; then
-      SEEN_DS["$ds_name"]=1
-      DS_NAME_LIST+=("$ds_name")
+    [[ -z "$ds_path" ]] && continue
+    if [[ -z "${SEEN_DS[$ds_path]+_}" ]]; then
+      SEEN_DS["$ds_path"]=1
+      DS_PATH_LIST+=("$ds_path")
     fi
-  done < <(echo "$DS_JSON" | jq -r '.[].Path')
+  done < <(govc find "$host" -type s 2>/dev/null)
 done
 
-if [[ ${#DS_NAME_LIST[@]} -eq 0 ]]; then
+if [[ ${#DS_PATH_LIST[@]} -eq 0 ]]; then
   echo "[ERROR] No datastores found for cluster '$CLUSTER'."
   exit 1
 fi
 
-echo "Found ${#DS_NAME_LIST[@]} unique datastore(s). Fetching capacity details..."
+echo "Found ${#DS_PATH_LIST[@]} unique datastore(s). Fetching capacity..."
 echo ""
 
 # --------------------------------------------------------------------------
-# Step 4: Fetch datastore info as JSON — one call per datastore
-# govc datastore.info -json handles names with spaces correctly when quoted
+# Step 3: Fetch capacity for each datastore via its full inventory path.
+#
+# govc ls -json "<full_path>" accepts the path as a single quoted argument
+# (space-safe) and returns Summary.Capacity / Summary.FreeSpace as raw bytes.
+# This is more reliable than govc datastore.info which takes bare names and
+# breaks on spaces and special characters.
 # --------------------------------------------------------------------------
 OUTPUT_LINES=()
 
-for ds_name in "${DS_NAME_LIST[@]}"; do
-  DS_INFO_JSON=$(govc datastore.info -json "$ds_name" 2>/dev/null) || continue
-  [[ -z "$DS_INFO_JSON" || "$DS_INFO_JSON" == "null" ]] && continue
+for ds_path in "${DS_PATH_LIST[@]}"; do
+  ds_name="${ds_path##*/}"
 
-  # Parse capacity and free bytes directly from JSON — no text parsing needed
-  CAP_BYTES=$(echo "$DS_INFO_JSON"  | jq -r '.[0].Summary.Capacity // 0')
-  FREE_BYTES=$(echo "$DS_INFO_JSON" | jq -r '.[0].Summary.FreeSpace // 0')
+  DS_JSON=$(govc ls -json "$ds_path" 2>/dev/null) || continue
+  [[ -z "$DS_JSON" || "$DS_JSON" == "null" ]] && continue
 
-  [[ "$CAP_BYTES" -eq 0 ]] && continue   # skip if no data returned
+  CAP_BYTES=$(echo  "$DS_JSON" | jq -r '.elements[0].Object.Summary.Capacity  // 0' 2>/dev/null)
+  FREE_BYTES=$(echo "$DS_JSON" | jq -r '.elements[0].Object.Summary.FreeSpace // 0' 2>/dev/null)
 
-  CAP_TIB=$(to_tib "$CAP_BYTES")
+  [[ -z "$CAP_BYTES"  || "$CAP_BYTES"  == "null" || "$CAP_BYTES"  -eq 0 ]] && continue
+  [[ -z "$FREE_BYTES" || "$FREE_BYTES" == "null" ]] && continue
+
+  CAP_TIB=$(to_tib  "$CAP_BYTES")
   FREE_TIB=$(to_tib "$FREE_BYTES")
   USED_TIB=$(awk "BEGIN { printf \"%.2f\", $CAP_TIB - $FREE_TIB }")
   FREE_PCT=$(awk "BEGIN { printf \"%.1f\", ($FREE_TIB / $CAP_TIB) * 100 }")
 
-  # Pipe-delimited row: name|capacity|used|free|free_pct
-  OUTPUT_LINES+=("${ds_name}|${CAP_TIB}|${USED_TIB}|${FREE_TIB}|${FREE_PCT}")
+  # Stored as: free_bytes|name|capacity|used|free|free_pct
+  # free_bytes as first field gives numeric sort accuracy (avoids TiB float sort issues)
+  OUTPUT_LINES+=("${FREE_BYTES}|${ds_name}|${CAP_TIB}|${USED_TIB}|${FREE_TIB}|${FREE_PCT}")
 done
 
 if [[ ${#OUTPUT_LINES[@]} -eq 0 ]]; then
-  echo "[ERROR] Datastores were found but capacity details could not be retrieved."
+  echo "[ERROR] Could not retrieve capacity for any datastore. Check connectivity."
   exit 1
 fi
 
 # --------------------------------------------------------------------------
-# Sort
+# Sort by free bytes descending (highest free space first) — fixed, no flag
 # --------------------------------------------------------------------------
-case "$SORT_BY" in
-  name)     SORT_FIELD=1; SORT_FLAG="" ;;
-  capacity) SORT_FIELD=2; SORT_FLAG="-rn" ;;
-  used)     SORT_FIELD=3; SORT_FLAG="-rn" ;;
-  free)     SORT_FIELD=4; SORT_FLAG="-rn" ;;
-esac
-
-SORTED=$(printf '%s\n' "${OUTPUT_LINES[@]}" | sort ${SORT_FLAG:-} -t'|' -k"$SORT_FIELD")
+SORTED=$(printf '%s\n' "${OUTPUT_LINES[@]}" | sort -rn -t'|' -k1)
 
 # --------------------------------------------------------------------------
 # Print table
 # --------------------------------------------------------------------------
-HEADER=$(printf "%-50s %13s %12s %12s %8s" "DATASTORE" "CAPACITY(TiB)" "USED(TiB)" "FREE(TiB)" "FREE%")
-DIVIDER=$(printf '%0.s-' {1..100})
+DIVIDER=$(printf '%0.s-' {1..97})
 
-echo "$HEADER"
+printf "\n"
+printf "%-50s %13s %12s %12s %8s\n" "DATASTORE" "CAPACITY(TiB)" "USED(TiB)" "FREE(TiB)" "FREE%"
 echo "$DIVIDER"
 
-while IFS='|' read -r name cap used free pct; do
+while IFS='|' read -r _bytes name cap used free pct; do
   flag=""
-  if awk "BEGIN { exit !($pct < 20) }"; then flag="  [!!]"; fi
-
-  printf "%-50s %13s %12s %12s %7s%%%s\n" \
-    "$name" "$cap" "$used" "$free" "$pct" "$flag"
+  awk "BEGIN { exit !($pct < 20) }" && flag="  [!!]"
+  printf "%-50s %13s %12s %12s %7s%%%s\n" "$name" "$cap" "$used" "$free" "$pct" "$flag"
 done <<< "$SORTED"
 
 echo "$DIVIDER"
-echo ""
-echo "  [!!] = Less than 20% free space — avoid for new VM provisioning"
-echo ""
-echo "Total datastores : ${#OUTPUT_LINES[@]}"
-echo "Cluster          : $CLUSTER_PATH"
-echo ""
+printf "\n"
+printf "  [!!] = Less than 20%% free — avoid for new VM provisioning\n"
+printf "  Output sorted by free space — highest available on top\n"
+printf "\n"
+printf "  Total datastores : %s\n" "${#OUTPUT_LINES[@]}"
+printf "  Cluster          : %s\n" "$CLUSTER_PATH"
+printf "\n"
