@@ -130,14 +130,14 @@ fi
 
 echo "Found ${#HOST_LIST[@]} host(s). Collecting datastores..."
 
-declare -A SEEN_DS=()
 declare -a DS_PATH_LIST=()
+DS_SEEN_LOG=""
 
 for host in "${HOST_LIST[@]}"; do
   while IFS= read -r ds_path; do
     [[ -z "$ds_path" ]] && continue
-    if [[ -z "${SEEN_DS[$ds_path]+_}" ]]; then
-      SEEN_DS["$ds_path"]=1
+    if ! printf '%s' "$DS_SEEN_LOG" | grep -qxF "$ds_path"; then
+      DS_SEEN_LOG="${DS_SEEN_LOG}${ds_path}"$'\n'
       DS_PATH_LIST+=("$ds_path")
     fi
   done < <(govc find "$host" -type s 2>/dev/null)
